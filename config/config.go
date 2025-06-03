@@ -184,7 +184,7 @@ func parseTimeString(timeStr string) (time.Time, error) {
 	return time.Date(now.Year(), now.Month(), now.Day(), hour, minute, 0, 0, now.Location()), nil
 }
 
-// 현재 시간이 운영 시간 내인지 확인
+// 현재 시간이 운영 시간 내인지 확인 - 수정된 버전
 func (oh *OperatingHours) IsOperatingTime() bool {
 	if !oh.IsEnabled {
 		return true // 운영 시간 제한이 비활성화된 경우 항상 true
@@ -192,25 +192,36 @@ func (oh *OperatingHours) IsOperatingTime() bool {
 
 	now := time.Now()
 
-	// 오늘 날짜 기준으로 시작/종료 시간 업데이트
+	// 오늘 날짜 기준으로 시작/종료 시간 생성
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-	startTime := today.Add(time.Duration(oh.StartTime.Hour())*time.Hour + time.Duration(oh.StartTime.Minute())*time.Minute)
-	endTime := today.Add(time.Duration(oh.EndTime.Hour())*time.Hour + time.Duration(oh.EndTime.Minute())*time.Minute)
 
-	// 종료 시간이 시작 시간보다 이른 경우 (자정을 넘는 경우)
-	if endTime.Before(startTime) {
-		endTime = endTime.Add(24 * time.Hour)
-		// 현재 시간이 자정을 넘었는지 확인
-		if now.Before(startTime) {
-			// 자정 이후인 경우, 어제 시작시간과 비교
-			startTime = startTime.Add(-24 * time.Hour)
+	// 시작 시간과 종료 시간을 오늘 날짜로 설정
+	startHour := oh.StartTime.Hour()
+	startMinute := oh.StartTime.Minute()
+	endHour := oh.EndTime.Hour()
+	endMinute := oh.EndTime.Minute()
+
+	startTime := today.Add(time.Duration(startHour)*time.Hour + time.Duration(startMinute)*time.Minute)
+	endTime := today.Add(time.Duration(endHour)*time.Hour + time.Duration(endMinute)*time.Minute)
+
+	// 종료 시간이 시작 시간보다 이른 경우 (자정을 넘는 경우 - 예: 23:00 ~ 05:00)
+	if endTime.Before(startTime) || endTime.Equal(startTime) {
+		// 자정을 넘는 운영시간
+		// 현재시간이 시작시간 이후이거나 종료시간 이전인 경우
+		if now.After(startTime) || now.Before(endTime) {
+			return true
 		}
+		return false
+	} else {
+		// 일반적인 운영시간 (예: 05:00 ~ 23:00)
+		if now.After(startTime) && now.Before(endTime) {
+			return true
+		}
+		return false
 	}
-
-	return now.After(startTime) && now.Before(endTime)
 }
 
-// 다음 운영 시작 시간까지의 시간 계산
+// 다음 운영 시작 시간까지의 시간 계산 - 수정된 버전
 func (oh *OperatingHours) TimeUntilNextOperating() time.Duration {
 	if !oh.IsEnabled {
 		return 0 // 운영 시간 제한이 비활성화된 경우
@@ -218,14 +229,41 @@ func (oh *OperatingHours) TimeUntilNextOperating() time.Duration {
 
 	now := time.Now()
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-	startTime := today.Add(time.Duration(oh.StartTime.Hour())*time.Hour + time.Duration(oh.StartTime.Minute())*time.Minute)
 
-	// 오늘 시작 시간이 이미 지났다면 내일 시작 시간으로 설정
-	if now.After(startTime) {
-		startTime = startTime.Add(24 * time.Hour)
+	startHour := oh.StartTime.Hour()
+	startMinute := oh.StartTime.Minute()
+	endHour := oh.EndTime.Hour()
+	endMinute := oh.EndTime.Minute()
+
+	startTime := today.Add(time.Duration(startHour)*time.Hour + time.Duration(startMinute)*time.Minute)
+	endTime := today.Add(time.Duration(endHour)*time.Hour + time.Duration(endMinute)*time.Minute)
+
+	// 자정을 넘는 운영시간인지 확인
+	if endTime.Before(startTime) || endTime.Equal(startTime) {
+		// 자정을 넘는 경우
+		if now.After(endTime) && now.Before(startTime) {
+			// 운영 종료 후 ~ 운영 시작 전 (오늘 시작시간까지 대기)
+			return startTime.Sub(now)
+		} else if now.Before(endTime) {
+			// 자정 넘어서 운영 중 (내일 시작시간까지 대기)
+			nextStartTime := startTime.Add(24 * time.Hour)
+			return nextStartTime.Sub(now)
+		} else {
+			// now >= startTime (운영 중이므로 내일 시작시간까지)
+			nextStartTime := startTime.Add(24 * time.Hour)
+			return nextStartTime.Sub(now)
+		}
+	} else {
+		// 일반적인 운영시간
+		if now.Before(startTime) {
+			// 오늘 시작시간 전
+			return startTime.Sub(now)
+		} else {
+			// 오늘 시작시간 후 (내일 시작시간까지)
+			nextStartTime := startTime.Add(24 * time.Hour)
+			return nextStartTime.Sub(now)
+		}
 	}
-
-	return startTime.Sub(now)
 }
 
 // RouteID 파싱 (콤마로 구분된 문자열을 배열로 변환)

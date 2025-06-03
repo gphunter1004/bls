@@ -24,6 +24,9 @@ func main() {
 
 	utils.LogInfo("버스 위치 정보 데이터 수집 시스템을 시작합니다...")
 
+	// 초기 운영시간 체크
+	checkOperatingHours()
+
 	// 서비스 초기화 - 병렬로 수행
 	timer := utils.StartTimer("서비스 초기화")
 
