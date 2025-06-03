@@ -48,10 +48,10 @@ type BusLocationResponse struct {
 
 // 버스 위치 정보 구조체 (API 1)
 type BusLocationInfo struct {
-	Crowded       int    `json:"crowded"`  // 차내혼잡도 (1:여유, 2:보통, 3:혼잡, 4:매우혼잡) 차내혼잡도 제공노선유형 (13:일반형시내버스, 15:따복형시내버스, 23:일반형농어촌버스)
+	Crowded       int    `json:"crowded"`  // 차내혼잡도 (1:여유, 2:보통, 3:혼잡, 4:매우혼잡)
 	LowPlate      int    `json:"lowPlate"` // 특수차량여부 (0: 일반버스, 1: 저상버스, 2: 2층버스, 5: 전세버스, 6: 예약버스, 7: 트롤리)
 	PlateNo       string `json:"plateNo"`
-	RemainSeatCnt int    `json:"remainSeatCnt"` // 차내빈자리수 (-1:정보없음, 0~:빈자리 수) 차내빈자리수 제공노선유형 (11: 직행좌석형시내버스, 12:좌석형시내버스, 14: 광역급행형시내버스, 16: 경기순환버스, 17: 준공영제직행좌석시내버스, 21: 직행좌석형농어촌버스, 22: 좌석형농어촌버스)
+	RemainSeatCnt int    `json:"remainSeatCnt"` // 차내빈자리수 (-1:정보없음, 0~:빈자리 수)
 	RouteID       int64  `json:"routeId"`       // API1에서 사용하는 숫자형 노선ID
 	RouteTypeCd   int    `json:"routeTypeCd"`   // 노선유형코드
 	StateCd       int    `json:"stateCd"`       // 상태코드 (0:교차로통과, 1:정류소 도착, 2:정류소 출발)
@@ -108,24 +108,151 @@ func (b *BusRealtimeInfo) GetRedisKey(routeID string) string {
 	return fmt.Sprintf("kr_bus_realtime:%s", routeID)
 }
 
-// 통합 버스 위치 정보 구조체 (확장용)
+// 통합 버스 위치 정보 구조체 (Elasticsearch용)
 type UnifiedBusLocation struct {
-	RouteID   string `json:"routeId"`
-	Timestamp int64  `json:"timestamp"`
-	VehicleID string `json:"vehicleId"`
-	VehicleNo string `json:"vehicleNo"`
+	// 공통 필드
+	RouteID    string `json:"routeId"`    // 노선 ID
+	Timestamp  int64  `json:"timestamp"`  // 타임스탬프 (Unix timestamp)
+	DataSource string `json:"dataSource"` // 데이터 소스 (api1_gg_location, api2_kr_realtime)
+	VehicleID  string `json:"vehicleId"`  // 차량 ID
+	VehicleNo  string `json:"vehicleNo"`  // 차량 번호
 
-	// API 1 전용 필드
-	StationSeq    int  `json:"stationSeq"`
-	Crowded       *int `json:"crowded,omitempty"`
-	RemainSeatCnt *int `json:"remainSeatCnt,omitempty"`
-	StateCd       *int `json:"stateCd,omitempty"`
+	// 운행 상태 (새로 추가)
+	OperationStatus string `json:"operationStatus"` // 운행상태 (operating, ending)
 
-	// API 2 전용 필드
-	NodeOrd   int     `json:"nodeOrd"`
-	GPSLati   float64 `json:"gpsLati"`
-	GPSLong   float64 `json:"gpsLong"`
-	NodeID    *string `json:"nodeId,omitempty"`
-	NodeName  *string `json:"nodeName,omitempty"`
-	RouteName *string `json:"routeName,omitempty"`
+	// GPS 좌표 (주로 API 2에서 제공)
+	GPSLati float64 `json:"gpsLati"` // 위도
+	GPSLong float64 `json:"gpsLong"` // 경도
+
+	// API 1 전용 필드 (경기도 버스 위치 정보)
+	StationSeq    int    `json:"stationSeq"`              // 정류소 순번
+	Crowded       *int   `json:"crowded,omitempty"`       // 차내혼잡도
+	RemainSeatCnt *int   `json:"remainSeatCnt,omitempty"` // 차내빈자리수
+	StateCd       *int   `json:"stateCd,omitempty"`       // 상태코드
+	LowPlate      *int   `json:"lowPlate,omitempty"`      // 특수차량여부
+	TaglessCd     *int   `json:"taglessCd,omitempty"`     // 태그리스 서비스 여부
+	RouteTypeCd   *int   `json:"routeTypeCd,omitempty"`   // 노선유형코드
+	StationID     *int64 `json:"stationId,omitempty"`     // 정류소 ID
+
+	// API 2 전용 필드 (국토교통부 버스 실시간 위치 정보)
+	NodeOrd   int     `json:"nodeOrd"`             // 정류소 순서
+	NodeID    *string `json:"nodeId,omitempty"`    // 정류소 ID
+	NodeName  *string `json:"nodeName,omitempty"`  // 정류소 이름
+	RouteName *string `json:"routeName,omitempty"` // 노선 이름
+	RouteType *string `json:"routeType,omitempty"` // 노선 유형
+}
+
+// Elasticsearch 문서 ID 생성
+func (u *UnifiedBusLocation) GetDocumentID() string {
+	return fmt.Sprintf("%s_%s_%d_%s", u.RouteID, u.VehicleID, u.Timestamp, u.DataSource)
+}
+
+// 데이터 검증
+func (u *UnifiedBusLocation) IsValid() bool {
+	// 필수 필드 검증
+	if u.RouteID == "" || u.VehicleID == "" || u.Timestamp == 0 {
+		return false
+	}
+
+	// 통합 데이터는 항상 유효
+	if u.DataSource == "unified" {
+		return true
+	}
+
+	return false
+}
+
+// GPS 좌표 유효성 검증
+func (u *UnifiedBusLocation) HasValidGPS() bool {
+	return u.GPSLati != 0 && u.GPSLong != 0 &&
+		u.GPSLati >= -90 && u.GPSLati <= 90 &&
+		u.GPSLong >= -180 && u.GPSLong <= 180
+}
+
+// 차내 혼잡도 문자열 변환
+func (u *UnifiedBusLocation) GetCrowdedStatus() string {
+	if u.Crowded == nil {
+		return "정보없음"
+	}
+
+	switch *u.Crowded {
+	case 1:
+		return "여유"
+	case 2:
+		return "보통"
+	case 3:
+		return "혼잡"
+	case 4:
+		return "매우혼잡"
+	default:
+		return "알 수 없음"
+	}
+}
+
+// 차량 상태 문자열 변환
+func (u *UnifiedBusLocation) GetStateDescription() string {
+	if u.StateCd == nil {
+		return "정보없음"
+	}
+
+	switch *u.StateCd {
+	case 0:
+		return "교차로통과"
+	case 1:
+		return "정류소도착"
+	case 2:
+		return "정류소출발"
+	default:
+		return "알 수 없음"
+	}
+}
+
+// JSON 직렬화용 맵 변환 (핵심 필드만)
+func (u *UnifiedBusLocation) ToMap() map[string]interface{} {
+	result := map[string]interface{}{
+		"routeId":         u.RouteID,
+		"timestamp":       u.Timestamp,
+		"dataSource":      u.DataSource,
+		"vehicleId":       u.VehicleID,
+		"vehicleNo":       u.VehicleNo,
+		"operationStatus": u.OperationStatus,
+	}
+
+	// GPS 좌표
+	if u.HasValidGPS() {
+		result["gpsLati"] = u.GPSLati
+		result["gpsLong"] = u.GPSLong
+		result["location"] = map[string]interface{}{
+			"lat": u.GPSLati,
+			"lon": u.GPSLong,
+		}
+	}
+
+	// 정류장 정보
+	if u.NodeOrd > 0 {
+		result["nodeOrd"] = u.NodeOrd
+	}
+	if u.NodeName != nil {
+		result["nodeName"] = *u.NodeName
+	}
+	if u.StationSeq > 0 {
+		result["stationSeq"] = u.StationSeq
+	}
+
+	// 혼잡도 정보
+	if u.Crowded != nil {
+		result["crowded"] = *u.Crowded
+		result["crowdedStatus"] = u.GetCrowdedStatus()
+	}
+	if u.RemainSeatCnt != nil {
+		result["remainSeatCnt"] = *u.RemainSeatCnt
+	}
+
+	// 버스 상태
+	if u.StateCd != nil {
+		result["stateCd"] = *u.StateCd
+		result["stateDescription"] = u.GetStateDescription()
+	}
+
+	return result
 }

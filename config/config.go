@@ -20,12 +20,12 @@ type Config struct {
 	NumOfRows    int
 
 	// 버스 위치 정보 API (API 1)
-	BusLocationAPIURL      string
-	BusLocationInterval    int
+	BusLocationAPIURL   string
+	BusLocationInterval int
 
 	// 버스 실시간 위치 정보 API (API 2)
-	BusRealtimeAPIURL      string
-	BusRealtimeInterval    int
+	BusRealtimeAPIURL   string
+	BusRealtimeInterval int
 
 	// Redis 설정
 	RedisAddr     string
@@ -36,6 +36,9 @@ type Config struct {
 	ESAddr     string
 	ESUsername string
 	ESPassword string
+
+	// Elasticsearch 통합 인덱스 설정
+	ESUnifiedIndex string // 통합 버스 위치 데이터용 인덱스
 }
 
 var AppConfig *Config
@@ -68,6 +71,9 @@ func Init() error {
 		ESAddr:     getEnvOrDefault("ELASTICSEARCH_ADDR", "http://localhost:9200"),
 		ESUsername: getEnvOrDefault("ELASTICSEARCH_USERNAME", ""),
 		ESPassword: getEnvOrDefault("ELASTICSEARCH_PASSWORD", ""),
+
+		// Elasticsearch 통합 인덱스 설정
+		ESUnifiedIndex: getEnvOrDefault("ES_UNIFIED_INDEX", "bus-unified-location"),
 	}
 
 	// 필수 설정 검증
@@ -83,12 +89,12 @@ func parseRouteIDs(routeIDStr string) []string {
 	if routeIDStr == "" {
 		return []string{}
 	}
-	
+
 	routeIDs := strings.Split(routeIDStr, ",")
 	for i, routeID := range routeIDs {
 		routeIDs[i] = strings.TrimSpace(routeID)
 	}
-	
+
 	return routeIDs
 }
 

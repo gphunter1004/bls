@@ -35,6 +35,15 @@ func main() {
 	}
 	defer redisService.Close()
 
+	// Elasticsearch 서비스 초기화
+	esService, err := services.NewElasticsearchService()
+	if err != nil {
+		log.Fatal("Elasticsearch 서비스 초기화 실패:", err)
+	}
+
+	// ElasticsearchService에 RedisService 참조 설정
+	esService.SetRedisService(redisService)
+
 	timer.Stop()
 
 	// 초기 정류장 데이터 수집 및 저장
@@ -53,16 +62,20 @@ func main() {
 		startBusLocationCollection(apiService, redisService, stopChan)
 	}()
 
-	// API 2: 버스 실시간 위치 정보 수집 (10초 간격)
+	// API 2: 버스 실시간 위치 정보 수집 (10초 간격) - ES 동기화 포함
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		startBusRealtimeCollection(apiService, redisService, stopChan)
+		startBusRealtimeCollection(apiService, redisService, esService, stopChan)
 	}()
 
 	utils.LogInfo("실시간 데이터 수집이 시작되었습니다.")
 	utils.LogInfo("- 버스 위치 정보: %d초 간격", config.AppConfig.BusLocationInterval)
-	utils.LogInfo("- 버스 실시간 정보: %d초 간격", config.AppConfig.BusRealtimeInterval)
+	utils.LogInfo("- 버스 실시간 정보 + ES 동기화: %d초 간격", config.AppConfig.BusRealtimeInterval)
+
+	// 초기 API1 데이터 수집 (테스트용)
+	utils.LogInfo("🔄 초기 API1 데이터 수집 시작...")
+	collectBusData("API1", apiService, redisService, nil)
 
 	// 프로그램 종료 시그널 대기
 	waitForShutdown(stopChan, &wg)
@@ -117,7 +130,7 @@ func startBusLocationCollection(apiService *services.APIService, redisService *s
 	for {
 		select {
 		case <-stopChan:
-			utils.LogInfo("버스 실시간 위치 정보 수집을 종료합니다")
+			utils.LogInfo("버스 위치 정보 수집을 종료합니다")
 			return
 		case <-ticker.C:
 			collectBusLocations(apiService, redisService)
@@ -133,7 +146,11 @@ func collectBusLocations(apiService *services.APIService, redisService *services
 	totalBuses := 0
 	successRoutes := 0
 
+	utils.LogInfo("🚌 API1 버스 위치 정보 수집 시작")
+
 	for _, routeID := range config.AppConfig.RouteIDs {
+		utils.LogInfo("노선 %s API1 데이터 수집 중...", routeID)
+
 		busLocations, err := apiService.FetchBusLocation(routeID)
 		if err != nil {
 			utils.LogError("노선 %s 버스 위치 정보 수집 실패: %v", routeID, err)
@@ -141,8 +158,16 @@ func collectBusLocations(apiService *services.APIService, redisService *services
 		}
 
 		if len(busLocations) == 0 {
-			utils.LogDebug("노선 %s: 현재 운행 중인 버스가 없습니다", routeID)
+			utils.LogWarn("노선 %s: 현재 운행 중인 버스가 없습니다 (API1)", routeID)
 			continue
+		}
+
+		utils.LogInfo("노선 %s: API1에서 %d대 버스 데이터 수집됨", routeID, len(busLocations))
+
+		// 수집된 버스 정보 로깅
+		for i, bus := range busLocations {
+			utils.LogDebug("  [%d] PlateNo: %s, VehId: %d, StationSeq: %d, Crowded: %d",
+				i+1, bus.PlateNo, bus.VehID, bus.StationSeq, bus.Crowded)
 		}
 
 		// Redis에 저장
@@ -153,23 +178,25 @@ func collectBusLocations(apiService *services.APIService, redisService *services
 
 		totalBuses += len(busLocations)
 		successRoutes++
-		utils.LogDebug("노선 %s: %d대 버스 위치 정보 저장", routeID, len(busLocations))
+		utils.LogInfo("✅ 노선 %s: %d대 버스 위치 정보 저장 완료", routeID, len(busLocations))
 
 		// API 호출 간격 조절
 		time.Sleep(100 * time.Millisecond)
 	}
 
 	if totalBuses > 0 {
-		utils.LogInfo("버스 위치 정보: %d개 노선, %d대 버스 데이터 수집 완료", successRoutes, totalBuses)
+		utils.LogInfo("🎯 API1 버스 위치 정보: %d개 노선, %d대 버스 데이터 수집 완료", successRoutes, totalBuses)
+	} else {
+		utils.LogWarn("⚠️ API1 버스 위치 정보: 수집된 데이터가 없습니다")
 	}
 }
 
-// API 2: 버스 위치 정보 수집 (고루틴)
-func startBusRealtimeCollection(apiService *services.APIService, redisService *services.RedisService, stopChan chan struct{}) {
+// API 2: 버스 실시간 위치 정보 수집 (고루틴) - ES 동기화 포함
+func startBusRealtimeCollection(apiService *services.APIService, redisService *services.RedisService, esService *services.ElasticsearchService, stopChan chan struct{}) {
 	ticker := time.NewTicker(time.Duration(config.AppConfig.BusRealtimeInterval) * time.Second)
 	defer ticker.Stop()
 
-	utils.LogInfo("버스 위치 정보 수집을 시작합니다 (간격: %d초)", config.AppConfig.BusRealtimeInterval)
+	utils.LogInfo("버스 실시간 위치 정보 수집 + ES 동기화를 시작합니다 (간격: %d초)", config.AppConfig.BusRealtimeInterval)
 
 	for {
 		select {
@@ -177,14 +204,14 @@ func startBusRealtimeCollection(apiService *services.APIService, redisService *s
 			utils.LogInfo("버스 실시간 위치 정보 수집을 종료합니다")
 			return
 		case <-ticker.C:
-			collectBusRealtime(apiService, redisService)
+			collectBusRealtimeAndSync(apiService, redisService, esService)
 		}
 	}
 }
 
-// 버스 실시간 위치 정보 수집 실행
-func collectBusRealtime(apiService *services.APIService, redisService *services.RedisService) {
-	timer := utils.StartTimer("버스 실시간 위치 정보 수집")
+// 버스 실시간 위치 정보 수집 + ES 동기화 실행
+func collectBusRealtimeAndSync(apiService *services.APIService, redisService *services.RedisService, esService *services.ElasticsearchService) {
+	timer := utils.StartTimer("버스 실시간 위치 정보 수집 + ES 동기화")
 	defer timer.Stop()
 
 	totalBuses := 0
@@ -218,6 +245,16 @@ func collectBusRealtime(apiService *services.APIService, redisService *services.
 
 	if totalBuses > 0 {
 		utils.LogInfo("버스 실시간 정보: %d개 노선, %d대 버스 데이터 수집 완료", successRoutes, totalBuses)
+
+		// API2 데이터 수집 완료 후 즉시 ES 동기화 수행
+		syncElasticsearchData(esService, redisService)
+	}
+}
+
+// Elasticsearch 데이터 동기화 실행
+func syncElasticsearchData(esService *services.ElasticsearchService, redisService *services.RedisService) {
+	if err := esService.SyncUnifiedDataFromRedis(redisService); err != nil {
+		utils.LogError("Elasticsearch 데이터 동기화 실패: %v", err)
 	}
 }
 
