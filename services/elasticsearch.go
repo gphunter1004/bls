@@ -87,6 +87,7 @@ func (es *ElasticsearchService) initializeIndex() error {
 			"mappings": {
 				"properties": {
 					"routeId": {"type": "keyword"},
+					"routeName": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
 					"timestamp": {"type": "date", "format": "epoch_second"},
 					"vehicleId": {"type": "keyword"},
 					"vehicleNo": {"type": "keyword"},
@@ -223,7 +224,28 @@ func (es *ElasticsearchService) createUnifiedData(redisService *RedisService, ro
 	return unifiedData
 }
 
-// === 차량별 데이터 병합 ===
+// Redis 캐시에서 정류장명 조회
+func (es *ElasticsearchService) getNodeNameFromCache(routeID string, nodeOrd int) string {
+	if es.redisService == nil {
+		return ""
+	}
+
+	// Redis에서 특정 정류장 정보 조회
+	busStop, err := es.redisService.GetBusStop(routeID, nodeOrd)
+	if err != nil {
+		utils.LogDebug("정류장 캐시 조회 실패 - 노선: %s, nodeOrd: %d, 에러: %v", routeID, nodeOrd, err)
+		return ""
+	}
+
+	if busStop != nil && busStop.NodeName != "" {
+		utils.LogDebug("정류장 캐시 조회 성공 - 노선: %s, nodeOrd: %d, 정류장명: %s", routeID, nodeOrd, busStop.NodeName)
+		return busStop.NodeName
+	}
+
+	return ""
+}
+
+// === 차량별 데이터 병합 === - int 기준 통일
 func (es *ElasticsearchService) mergeVehicleData(routeID, vehicleNo string, api1Data, api2Data map[string]interface{}) *models.UnifiedBusLocation {
 	if api2Data == nil {
 		return nil
@@ -248,8 +270,43 @@ func (es *ElasticsearchService) mergeVehicleData(routeID, vehicleNo string, api1
 	if nodeOrd, ok := api2Data["nodeord"].(float64); ok {
 		unified.NodeOrd = int(nodeOrd)
 	}
-	if nodeName, ok := api2Data["nodenm"].(string); ok {
+
+	// NodeName 처리 - Redis 캐시 활용
+	if nodeName, ok := api2Data["nodenm"].(string); ok && nodeName != "" {
 		unified.NodeName = &nodeName
+	} else {
+		// API2에서 nodeName이 없거나 비어있는 경우 Redis 캐시에서 조회
+		if unified.NodeOrd > 0 {
+			cachedNodeName := es.getNodeNameFromCache(routeID, unified.NodeOrd)
+			if cachedNodeName != "" {
+				unified.NodeName = &cachedNodeName
+				utils.LogDebug("차량 %s: Redis 캐시에서 정류장명 조회 성공 -> %s (nodeOrd: %d)", vehicleNo, cachedNodeName, unified.NodeOrd)
+			} else {
+				utils.LogWarn("차량 %s: Redis 캐시에서 정류장명 조회 실패 (nodeOrd: %d)", vehicleNo, unified.NodeOrd)
+			}
+		}
+	}
+
+	// RouteName 처리 - int 기준 통일
+	if routeNameInt, ok := api2Data["routenm"].(float64); ok {
+		// Redis에서 int로 저장된 값이 float64로 언마샬링됨
+		routeNameStr := fmt.Sprintf("%.0f", routeNameInt)
+		unified.RouteName = &routeNameStr
+		utils.LogDebug("차량 %s: routenm(int->string) -> %s", vehicleNo, routeNameStr)
+	} else if routeNameInt, ok := api2Data["routenm"].(int); ok {
+		// 직접 int로 저장된 경우
+		routeNameStr := fmt.Sprintf("%d", routeNameInt)
+		unified.RouteName = &routeNameStr
+		utils.LogDebug("차량 %s: routenm(int) -> %s", vehicleNo, routeNameStr)
+	} else {
+		// routenm이 없거나 파싱 실패한 경우 routeID 사용
+		unified.RouteName = &routeID
+		utils.LogWarn("차량 %s: routenm 파싱 실패, routeID 사용 -> %s", vehicleNo, routeID)
+	}
+
+	// RouteType 처리
+	if routeType, ok := api2Data["routetp"].(string); ok && routeType != "" {
+		unified.RouteType = &routeType
 	}
 
 	// API1 데이터 적용 (있는 경우)
@@ -307,11 +364,12 @@ func (es *ElasticsearchService) sendToElasticsearch(unifiedData []models.Unified
 		esDoc := data.ToMap()
 
 		// 전송 로그
-		utils.LogInfo("[%d] 차량: %s, 정류장: %d(%s), 혼잡도: %s, 상태: %s",
+		utils.LogInfo("[%d] 차량: %s, 정류장: %d(%s), 혼잡도: %s, 상태: %s, 노선명: %s",
 			i+1, data.VehicleNo, data.NodeOrd,
 			es.getNodeNameText(data.NodeName),
 			es.getCrowdedText(data.Crowded),
-			data.OperationStatus)
+			data.OperationStatus,
+			es.getRouteNameText(data.RouteName))
 
 		req := elastic.NewBulkIndexRequest().Index(indexName).Id(docID).Doc(esDoc)
 		bulkRequest = bulkRequest.Add(req)
@@ -400,4 +458,12 @@ func (es *ElasticsearchService) getNodeNameText(nodeName *string) string {
 		return "미지정"
 	}
 	return *nodeName
+}
+
+// 노선명 텍스트
+func (es *ElasticsearchService) getRouteNameText(routeName *string) string {
+	if routeName == nil {
+		return "미지정"
+	}
+	return *routeName
 }

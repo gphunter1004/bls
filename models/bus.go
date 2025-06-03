@@ -79,7 +79,7 @@ type BusRealtimeResponse struct {
 	} `json:"response"`
 }
 
-// 버스 실시간 위치 정보 구조체 (API 2)
+// 버스 실시간 위치 정보 구조체 (API 2) - int 기준 통일
 type BusRealtimeInfo struct {
 	GPSLati   float64 `json:"gpslati"`
 	GPSLong   float64 `json:"gpslong"`
@@ -138,7 +138,7 @@ type UnifiedBusLocation struct {
 	NodeOrd   int     `json:"nodeOrd"`             // 정류소 순서
 	NodeID    *string `json:"nodeId,omitempty"`    // 정류소 ID
 	NodeName  *string `json:"nodeName,omitempty"`  // 정류소 이름
-	RouteName *string `json:"routeName,omitempty"` // 노선 이름
+	RouteName *string `json:"routeName,omitempty"` // 노선 이름 (문자열로 저장)
 	RouteType *string `json:"routeType,omitempty"` // 노선 유형
 }
 
@@ -237,6 +237,15 @@ func (u *UnifiedBusLocation) ToMap() map[string]interface{} {
 	}
 	if u.StationSeq > 0 {
 		result["stationSeq"] = u.StationSeq
+	}
+
+	// 노선 정보
+	if u.RouteName != nil && *u.RouteName != "" {
+		result["routeName"] = *u.RouteName
+	}
+
+	if u.RouteType != nil {
+		result["routeType"] = *u.RouteType
 	}
 
 	// 혼잡도 정보

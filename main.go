@@ -75,7 +75,7 @@ func main() {
 
 	// 초기 API1 데이터 수집 (테스트용)
 	utils.LogInfo("🔄 초기 API1 데이터 수집 시작...")
-	collectBusData("API1", apiService, redisService, nil)
+	collectBusLocations(apiService, redisService)
 
 	// 프로그램 종료 시그널 대기
 	waitForShutdown(stopChan, &wg)
@@ -116,6 +116,13 @@ func collectInitialData(apiService *services.APIService, redisService *services.
 	}
 
 	utils.LogInfo("총 %d개 노선, %d개 정류장 데이터 저장 완료", len(config.AppConfig.RouteIDs), totalStops)
+
+	// 정류장 캐시 상태 확인 (디버깅용)
+	for _, routeID := range config.AppConfig.RouteIDs {
+		if err := redisService.CheckBusStopCache(routeID); err != nil {
+			utils.LogWarn("노선 %s 캐시 상태 확인 실패: %v", routeID, err)
+		}
+	}
 
 	return nil
 }
