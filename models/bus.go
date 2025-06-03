@@ -31,7 +31,7 @@ type BusStop struct {
 	RouteID  string  `json:"routeid"`
 }
 
-// API 1: 버스 위치 정보 응답 구조체
+// API 1: 버스 위치 정보 응답 구조체 - 유연한 구조
 type BusLocationResponse struct {
 	Response struct {
 		ComMsgHeader string `json:"comMsgHeader"`
@@ -41,7 +41,7 @@ type BusLocationResponse struct {
 			ResultMessage string `json:"resultMessage"`
 		} `json:"msgHeader"`
 		MsgBody struct {
-			BusLocationList []BusLocationInfo `json:"busLocationList"`
+			BusLocationList interface{} `json:"busLocationList"` // 배열 또는 단일 객체
 		} `json:"msgBody"`
 	} `json:"response"`
 }
@@ -61,7 +61,7 @@ type BusLocationInfo struct {
 	VehID         int64  `json:"vehId"`
 }
 
-// API 2: 버스 실시간 위치 정보 응답 구조체
+// API 2: 버스 실시간 위치 정보 응답 구조체 - 유연한 구조
 type BusRealtimeResponse struct {
 	Response struct {
 		Header struct {
@@ -70,7 +70,7 @@ type BusRealtimeResponse struct {
 		} `json:"header"`
 		Body struct {
 			Items struct {
-				Item []BusRealtimeInfo `json:"item"`
+				Item interface{} `json:"item"` // 배열 또는 단일 객체
 			} `json:"items"`
 			NumOfRows  int `json:"numOfRows"`
 			PageNo     int `json:"pageNo"`
@@ -79,16 +79,24 @@ type BusRealtimeResponse struct {
 	} `json:"response"`
 }
 
-// 버스 실시간 위치 정보 구조체 (API 2) - int 기준 통일
+// 버스 실시간 위치 정보 구조체 (API 2) - 실제 응답 기준 수정
 type BusRealtimeInfo struct {
 	GPSLati   float64 `json:"gpslati"`
 	GPSLong   float64 `json:"gpslong"`
-	NodeID    string  `json:"nodeid"`
-	NodeName  string  `json:"nodenm"`
+	NodeID    string  `json:"nodeid,omitempty"` // 선택적 필드
+	NodeName  string  `json:"nodenm,omitempty"` // 선택적 필드
 	NodeOrd   int     `json:"nodeord"`
-	RouteName int     `json:"routenm"`
-	RouteType string  `json:"routetp"`
+	RouteName int     `json:"routenm"`           // int로 고정
+	RouteType string  `json:"routetp,omitempty"` // 선택적 필드
 	VehicleNo string  `json:"vehicleno"`
+}
+
+// RouteName을 문자열로 변환하는 메서드
+func (b *BusRealtimeInfo) GetRouteNameString() string {
+	if b.RouteName == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d", b.RouteName)
 }
 
 // Redis 키 생성 메서드들
@@ -242,6 +250,9 @@ func (u *UnifiedBusLocation) ToMap() map[string]interface{} {
 	// 노선 정보
 	if u.RouteName != nil && *u.RouteName != "" {
 		result["routeName"] = *u.RouteName
+	} else {
+		// routeName이 없으면 routeId를 사용
+		result["routeName"] = u.RouteID
 	}
 
 	if u.RouteType != nil {

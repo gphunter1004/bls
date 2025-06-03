@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strconv"
+	"sync"
 	"time"
 
 	"bus-location-system/config"
@@ -114,7 +115,7 @@ func (es *ElasticsearchService) initializeIndex() error {
 	return nil
 }
 
-// === 메인 동기화 함수 ===
+// === 메인 동기화 함수 - 이벤트 기반 처리 ===
 func (es *ElasticsearchService) SyncUnifiedDataFromRedis(redisService *RedisService) error {
 	utils.LogInfo("📡 ES 동기화 시작")
 
@@ -129,7 +130,11 @@ func (es *ElasticsearchService) SyncUnifiedDataFromRedis(redisService *RedisServ
 		// 통합 데이터 생성 및 전송
 		unifiedData := es.createUnifiedData(redisService, routeID, changedVehicles)
 		if len(unifiedData) > 0 {
-			es.sendToElasticsearch(unifiedData)
+			// 각 노선별로 즉시 ES 전송 (이벤트 기반)
+			if err := es.sendToElasticsearch(unifiedData); err != nil {
+				utils.LogError("노선 %s ES 전송 실패: %v", routeID, err)
+				continue
+			}
 			totalDocs += len(unifiedData)
 		}
 	}
@@ -141,7 +146,7 @@ func (es *ElasticsearchService) SyncUnifiedDataFromRedis(redisService *RedisServ
 	return nil
 }
 
-// === 변경 감지 ===
+// === 변경 감지 최적화 - 병렬 처리 ===
 func (es *ElasticsearchService) detectChangedVehicles(redisService *RedisService, routeID string) []string {
 	// 활성 버스 목록 조회
 	vehicles, err := redisService.GetActiveBuses(routeID)
@@ -150,73 +155,118 @@ func (es *ElasticsearchService) detectChangedVehicles(redisService *RedisService
 		return []string{}
 	}
 
-	var changed []string
+	type vehicleCheck struct {
+		vehicleNo string
+		changed   bool
+	}
 
-	// 각 차량별로 변경 감지
+	checkChan := make(chan vehicleCheck, len(vehicles))
+	var wg sync.WaitGroup
+
+	// 각 차량을 병렬로 체크
 	for _, vehicleNo := range vehicles {
-		// 현재 및 이전 API2 데이터 조회
-		current, err1 := redisService.GetBusRealtimeByVehicle(routeID, vehicleNo)
-		previous, err2 := redisService.GetBusRealtimePreviousByVehicle(routeID, vehicleNo)
+		wg.Add(1)
+		go func(vehicleNo string) {
+			defer wg.Done()
 
-		if err1 != nil || current == nil {
-			continue // 현재 데이터가 없으면 스킵
-		}
+			// 현재 및 이전 API2 데이터 조회
+			current, err1 := redisService.GetBusRealtimeByVehicle(routeID, vehicleNo)
+			previous, err2 := redisService.GetBusRealtimePreviousByVehicle(routeID, vehicleNo)
 
-		currentNodeOrd := es.getNodeOrdFromData(current)
-
-		if err2 != nil || previous == nil {
-			// 이전 데이터가 없으면 새로운 버스
-			utils.LogInfo("🆕 노선 %s: 새로운 버스 %s (정류장 %d)", routeID, vehicleNo, currentNodeOrd)
-			changed = append(changed, vehicleNo)
-		} else {
-			// 정류장 변경 확인
-			previousNodeOrd := es.getNodeOrdFromData(previous)
-			if currentNodeOrd != previousNodeOrd {
-				utils.LogInfo("📍 노선 %s: 버스 %s 이동 (%d → %d)", routeID, vehicleNo, previousNodeOrd, currentNodeOrd)
-				changed = append(changed, vehicleNo)
+			if err1 != nil || current == nil {
+				return // 현재 데이터가 없으면 스킵
 			}
+
+			currentNodeOrd := es.getNodeOrdFromData(current)
+
+			if err2 != nil || previous == nil {
+				// 이전 데이터가 없으면 새로운 버스
+				utils.LogInfo("🆕 노선 %s: 새로운 버스 %s (정류장 %d)", routeID, vehicleNo, currentNodeOrd)
+				checkChan <- vehicleCheck{vehicleNo: vehicleNo, changed: true}
+			} else {
+				// 정류장 변경 확인
+				previousNodeOrd := es.getNodeOrdFromData(previous)
+				if currentNodeOrd != previousNodeOrd {
+					utils.LogInfo("📍 노선 %s: 버스 %s 이동 (%d → %d)", routeID, vehicleNo, previousNodeOrd, currentNodeOrd)
+					checkChan <- vehicleCheck{vehicleNo: vehicleNo, changed: true}
+				}
+			}
+		}(vehicleNo)
+	}
+
+	// 결과 수집용 고루틴
+	go func() {
+		wg.Wait()
+		close(checkChan)
+	}()
+
+	// 변경된 차량 목록 수집
+	var changed []string
+	for check := range checkChan {
+		if check.changed {
+			changed = append(changed, check.vehicleNo)
 		}
 	}
 
 	return changed
 }
 
-// === 통합 데이터 생성 ===
+// === 통합 데이터 생성 최적화 - 병렬 처리 ===
 func (es *ElasticsearchService) createUnifiedData(redisService *RedisService, routeID string, changedVehicles []string) []models.UnifiedBusLocation {
+	if len(changedVehicles) == 0 {
+		return []models.UnifiedBusLocation{}
+	}
+
+	utils.LogInfo("📋 노선 %s: %d개 변경된 차량의 통합 데이터 생성 시작 (병렬)", routeID, len(changedVehicles))
+
+	type vehicleData struct {
+		data *models.UnifiedBusLocation
+		err  error
+	}
+
+	dataChan := make(chan vehicleData, len(changedVehicles))
+	var wg sync.WaitGroup
+
+	// 각 차량을 병렬로 처리
+	for _, vehicleNo := range changedVehicles {
+		wg.Add(1)
+		go func(vehicleNo string) {
+			defer wg.Done()
+
+			// 차량별 API1, API2 데이터 조회
+			api1Data, err1 := redisService.GetBusLocationByVehicle(routeID, vehicleNo)
+			api2Data, err2 := redisService.GetBusRealtimeByVehicle(routeID, vehicleNo)
+
+			if err2 != nil || api2Data == nil {
+				utils.LogWarn("차량 %s: API2 데이터 없음", vehicleNo)
+				return
+			}
+
+			if err1 != nil {
+				utils.LogWarn("차량 %s API1 조회 실패: %v", vehicleNo, err1)
+			}
+
+			unified := es.mergeVehicleData(routeID, vehicleNo, api1Data, api2Data)
+			if unified != nil {
+				dataChan <- vehicleData{data: unified, err: nil}
+			}
+		}(vehicleNo)
+	}
+
+	// 결과 수집용 고루틴
+	go func() {
+		wg.Wait()
+		close(dataChan)
+	}()
+
+	// 결과 수집
 	var unifiedData []models.UnifiedBusLocation
-
-	utils.LogInfo("📋 노선 %s: %d개 변경된 차량의 통합 데이터 생성 시작", routeID, len(changedVehicles))
-
-	// 변경된 각 차량에 대해 통합 데이터 생성
-	for i, vehicleNo := range changedVehicles {
-		utils.LogInfo("🔍 [%d/%d] 차량 %s 데이터 조회 중...", i+1, len(changedVehicles), vehicleNo)
-
-		// 차량별 API1, API2 데이터 조회
-		api1Data, err1 := redisService.GetBusLocationByVehicle(routeID, vehicleNo)
-		api2Data, err2 := redisService.GetBusRealtimeByVehicle(routeID, vehicleNo)
-
-		if err1 != nil {
-			utils.LogWarn("차량 %s API1 조회 실패: %v", vehicleNo, err1)
-		}
-		if err2 != nil {
-			utils.LogError("차량 %s API2 조회 실패: %v", vehicleNo, err2)
+	for vData := range dataChan {
+		if vData.err != nil {
 			continue
 		}
-
-		if api2Data == nil {
-			utils.LogWarn("차량 %s: API2 데이터 없음", vehicleNo)
-			continue
-		}
-
-		if api1Data == nil {
-			utils.LogWarn("차량 %s: API1 데이터 없음 (API2 데이터만 사용)", vehicleNo)
-		}
-
-		unified := es.mergeVehicleData(routeID, vehicleNo, api1Data, api2Data)
-		if unified != nil {
-			unifiedData = append(unifiedData, *unified)
-			utils.LogInfo("🔗 통합완료: %s (정류장 %d, 혼잡도 %s)",
-				vehicleNo, unified.NodeOrd, es.getCrowdedText(unified.Crowded))
+		if vData.data != nil {
+			unifiedData = append(unifiedData, *vData.data)
 		}
 	}
 
@@ -348,11 +398,14 @@ func (es *ElasticsearchService) mergeVehicleData(routeID, vehicleNo string, api1
 	return unified
 }
 
-// === Elasticsearch 전송 ===
+// === Elasticsearch 전송 (이벤트 기반) ===
 func (es *ElasticsearchService) sendToElasticsearch(unifiedData []models.UnifiedBusLocation) error {
 	if len(unifiedData) == 0 {
 		return nil
 	}
+
+	sendTimer := utils.StartTimer(fmt.Sprintf("ES 전송 %d개 문서", len(unifiedData)))
+	defer sendTimer.Stop()
 
 	utils.LogInfo("📤 ES 전송: %d개 문서", len(unifiedData))
 
@@ -375,14 +428,25 @@ func (es *ElasticsearchService) sendToElasticsearch(unifiedData []models.Unified
 		bulkRequest = bulkRequest.Add(req)
 	}
 
-	// 벌크 실행
-	bulkResponse, err := bulkRequest.Do(es.ctx)
+	// 벌크 실행 (타임아웃 설정)
+	ctx, cancel := context.WithTimeout(es.ctx, 30*time.Second)
+	defer cancel()
+
+	bulkResponse, err := bulkRequest.Do(ctx)
 	if err != nil {
 		return fmt.Errorf("벌크 인덱싱 실패: %v", err)
 	}
 
 	if bulkResponse.Errors {
-		utils.LogError("일부 문서 인덱싱 실패")
+		// 실패한 문서 상세 로깅
+		for _, item := range bulkResponse.Items {
+			for action, result := range item {
+				if result.Error != nil {
+					utils.LogError("ES 인덱싱 실패 - Action: %s, ID: %s, Error: %v",
+						action, result.Id, result.Error)
+				}
+			}
+		}
 		return fmt.Errorf("일부 문서 인덱싱 실패")
 	}
 
