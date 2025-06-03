@@ -24,6 +24,11 @@ func SetLogLevel(level LogLevel) {
 	currentLogLevel = level
 }
 
+// 현재 로그 레벨 조회
+func GetLogLevel() LogLevel {
+	return currentLogLevel
+}
+
 // 디버그 로그
 func LogDebug(format string, args ...interface{}) {
 	if currentLogLevel <= LogLevelDebug {

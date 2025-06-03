@@ -1,13 +1,22 @@
 package config
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/joho/godotenv"
 )
+
+// OperatingHours 운영 시간 구조체
+type OperatingHours struct {
+	StartTime time.Time // 시작 시간 (오늘 날짜 기준)
+	EndTime   time.Time // 종료 시간 (다음날일 수 있음)
+	IsEnabled bool      // 운영 시간 제한 활성화 여부
+}
 
 // Config 구조체
 type Config struct {
@@ -20,12 +29,18 @@ type Config struct {
 	NumOfRows    int
 
 	// 버스 위치 정보 API (API 1)
-	BusLocationAPIURL      string
-	BusLocationInterval    int
+	BusLocationAPIURL   string
+	BusLocationInterval int
 
 	// 버스 실시간 위치 정보 API (API 2)
-	BusRealtimeAPIURL      string
-	BusRealtimeInterval    int
+	BusRealtimeAPIURL   string
+	BusRealtimeInterval int
+
+	// HTTP 클라이언트 설정
+	HTTPClientTimeout time.Duration
+
+	// 운영 시간 설정
+	OperatingHours OperatingHours
 
 	// Redis 설정
 	RedisAddr     string
@@ -36,6 +51,9 @@ type Config struct {
 	ESAddr     string
 	ESUsername string
 	ESPassword string
+
+	// Elasticsearch 통합 인덱스 설정
+	ESUnifiedIndex string // 통합 버스 위치 데이터용 인덱스
 }
 
 var AppConfig *Config
@@ -61,6 +79,12 @@ func Init() error {
 		BusRealtimeAPIURL:   getEnvOrDefault("BUS_REALTIME_API_URL", "http://apis.data.go.kr/1613000/BusLcInfoInqireService/getRouteAcctoBusLcList"),
 		BusRealtimeInterval: getEnvAsIntOrDefault("BUS_REALTIME_INTERVAL", 10),
 
+		// HTTP 클라이언트 타임아웃 설정 (초 단위)
+		HTTPClientTimeout: time.Duration(getEnvAsIntOrDefault("HTTP_CLIENT_TIMEOUT", 15)) * time.Second,
+
+		// 운영 시간 설정
+		OperatingHours: parseOperatingHours(),
+
 		RedisAddr:     getEnvOrDefault("REDIS_ADDR", "localhost:6379"),
 		RedisPassword: getEnvOrDefault("REDIS_PASSWORD", ""),
 		RedisDB:       getEnvAsIntOrDefault("REDIS_DB", 0),
@@ -68,6 +92,9 @@ func Init() error {
 		ESAddr:     getEnvOrDefault("ELASTICSEARCH_ADDR", "http://localhost:9200"),
 		ESUsername: getEnvOrDefault("ELASTICSEARCH_USERNAME", ""),
 		ESPassword: getEnvOrDefault("ELASTICSEARCH_PASSWORD", ""),
+
+		// Elasticsearch 통합 인덱스 설정
+		ESUnifiedIndex: getEnvOrDefault("ES_UNIFIED_INDEX", "bus-unified-location"),
 	}
 
 	// 필수 설정 검증
@@ -75,7 +102,168 @@ func Init() error {
 		log.Fatal("SERVICE_KEY가 설정되지 않았습니다")
 	}
 
+	// HTTP 타임아웃 검증 (최소 5초, 최대 60초)
+	if AppConfig.HTTPClientTimeout < 5*time.Second {
+		log.Printf("Warning: HTTP_CLIENT_TIMEOUT이 너무 짧습니다 (%v). 최소값 5초로 설정합니다.", AppConfig.HTTPClientTimeout)
+		AppConfig.HTTPClientTimeout = 5 * time.Second
+	}
+	if AppConfig.HTTPClientTimeout > 60*time.Second {
+		log.Printf("Warning: HTTP_CLIENT_TIMEOUT이 너무 깁니다 (%v). 최대값 60초로 설정합니다.", AppConfig.HTTPClientTimeout)
+		AppConfig.HTTPClientTimeout = 60 * time.Second
+	}
+
+	log.Printf("HTTP 클라이언트 타임아웃: %v", AppConfig.HTTPClientTimeout)
+
+	// 운영 시간 로그
+	if AppConfig.OperatingHours.IsEnabled {
+		log.Printf("운영 시간 설정: %s ~ %s",
+			AppConfig.OperatingHours.StartTime.Format("15:04"),
+			AppConfig.OperatingHours.EndTime.Format("15:04"))
+	} else {
+		log.Printf("운영 시간 제한: 비활성화 (24시간 운영)")
+	}
+
 	return nil
+}
+
+// 운영 시간 파싱
+func parseOperatingHours() OperatingHours {
+	// 운영 시간 활성화 여부
+	enabled := getEnvAsBoolOrDefault("OPERATING_HOURS_ENABLED", false)
+	if !enabled {
+		return OperatingHours{IsEnabled: false}
+	}
+
+	// 시작 시간과 종료 시간 파싱
+	startTimeStr := getEnvOrDefault("OPERATING_START_TIME", "05:00")
+	endTimeStr := getEnvOrDefault("OPERATING_END_TIME", "23:00")
+
+	startTime, err := parseTimeString(startTimeStr)
+	if err != nil {
+		log.Printf("Warning: OPERATING_START_TIME 파싱 실패 (%s): %v. 기본값 05:00 사용", startTimeStr, err)
+		startTime, _ = parseTimeString("05:00")
+	}
+
+	endTime, err := parseTimeString(endTimeStr)
+	if err != nil {
+		log.Printf("Warning: OPERATING_END_TIME 파싱 실패 (%s): %v. 기본값 23:00 사용", endTimeStr, err)
+		endTime, _ = parseTimeString("23:00")
+	}
+
+	// 종료 시간이 시작 시간보다 이른 경우 (자정을 넘는 경우)
+	if endTime.Before(startTime) {
+		endTime = endTime.Add(24 * time.Hour) // 다음날로 설정
+	}
+
+	return OperatingHours{
+		StartTime: startTime,
+		EndTime:   endTime,
+		IsEnabled: true,
+	}
+}
+
+// 시간 문자열 파싱 (HH:MM 형식)
+func parseTimeString(timeStr string) (time.Time, error) {
+	parts := strings.Split(timeStr, ":")
+	if len(parts) != 2 {
+		return time.Time{}, fmt.Errorf("시간 형식이 올바르지 않습니다: %s (HH:MM 형식 필요)", timeStr)
+	}
+
+	hour, err := strconv.Atoi(parts[0])
+	if err != nil || hour < 0 || hour > 23 {
+		return time.Time{}, fmt.Errorf("시간(시)이 올바르지 않습니다: %s (0-23)", parts[0])
+	}
+
+	minute, err := strconv.Atoi(parts[1])
+	if err != nil || minute < 0 || minute > 59 {
+		return time.Time{}, fmt.Errorf("시간(분)이 올바르지 않습니다: %s (0-59)", parts[1])
+	}
+
+	// 오늘 날짜를 기준으로 시간 생성
+	now := time.Now()
+	return time.Date(now.Year(), now.Month(), now.Day(), hour, minute, 0, 0, now.Location()), nil
+}
+
+// 현재 시간이 운영 시간 내인지 확인 - 수정된 버전
+func (oh *OperatingHours) IsOperatingTime() bool {
+	if !oh.IsEnabled {
+		return true // 운영 시간 제한이 비활성화된 경우 항상 true
+	}
+
+	now := time.Now()
+
+	// 오늘 날짜 기준으로 시작/종료 시간 생성
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+
+	// 시작 시간과 종료 시간을 오늘 날짜로 설정
+	startHour := oh.StartTime.Hour()
+	startMinute := oh.StartTime.Minute()
+	endHour := oh.EndTime.Hour()
+	endMinute := oh.EndTime.Minute()
+
+	startTime := today.Add(time.Duration(startHour)*time.Hour + time.Duration(startMinute)*time.Minute)
+	endTime := today.Add(time.Duration(endHour)*time.Hour + time.Duration(endMinute)*time.Minute)
+
+	// 종료 시간이 시작 시간보다 이른 경우 (자정을 넘는 경우 - 예: 23:00 ~ 05:00)
+	if endTime.Before(startTime) || endTime.Equal(startTime) {
+		// 자정을 넘는 운영시간
+		// 현재시간이 시작시간 이후이거나 종료시간 이전인 경우
+		if now.After(startTime) || now.Before(endTime) {
+			return true
+		}
+		return false
+	} else {
+		// 일반적인 운영시간 (예: 05:00 ~ 23:00)
+		if now.After(startTime) && now.Before(endTime) {
+			return true
+		}
+		return false
+	}
+}
+
+// 다음 운영 시작 시간까지의 시간 계산 - 수정된 버전
+func (oh *OperatingHours) TimeUntilNextOperating() time.Duration {
+	if !oh.IsEnabled {
+		return 0 // 운영 시간 제한이 비활성화된 경우
+	}
+
+	now := time.Now()
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+
+	startHour := oh.StartTime.Hour()
+	startMinute := oh.StartTime.Minute()
+	endHour := oh.EndTime.Hour()
+	endMinute := oh.EndTime.Minute()
+
+	startTime := today.Add(time.Duration(startHour)*time.Hour + time.Duration(startMinute)*time.Minute)
+	endTime := today.Add(time.Duration(endHour)*time.Hour + time.Duration(endMinute)*time.Minute)
+
+	// 자정을 넘는 운영시간인지 확인
+	if endTime.Before(startTime) || endTime.Equal(startTime) {
+		// 자정을 넘는 경우
+		if now.After(endTime) && now.Before(startTime) {
+			// 운영 종료 후 ~ 운영 시작 전 (오늘 시작시간까지 대기)
+			return startTime.Sub(now)
+		} else if now.Before(endTime) {
+			// 자정 넘어서 운영 중 (내일 시작시간까지 대기)
+			nextStartTime := startTime.Add(24 * time.Hour)
+			return nextStartTime.Sub(now)
+		} else {
+			// now >= startTime (운영 중이므로 내일 시작시간까지)
+			nextStartTime := startTime.Add(24 * time.Hour)
+			return nextStartTime.Sub(now)
+		}
+	} else {
+		// 일반적인 운영시간
+		if now.Before(startTime) {
+			// 오늘 시작시간 전
+			return startTime.Sub(now)
+		} else {
+			// 오늘 시작시간 후 (내일 시작시간까지)
+			nextStartTime := startTime.Add(24 * time.Hour)
+			return nextStartTime.Sub(now)
+		}
+	}
 }
 
 // RouteID 파싱 (콤마로 구분된 문자열을 배열로 변환)
@@ -83,12 +271,12 @@ func parseRouteIDs(routeIDStr string) []string {
 	if routeIDStr == "" {
 		return []string{}
 	}
-	
+
 	routeIDs := strings.Split(routeIDStr, ",")
 	for i, routeID := range routeIDs {
 		routeIDs[i] = strings.TrimSpace(routeID)
 	}
-	
+
 	return routeIDs
 }
 
@@ -117,6 +305,15 @@ func getEnvAsIntOrDefault(key string, defaultValue int) int {
 	if value := os.Getenv(key); value != "" {
 		if intValue, err := strconv.Atoi(value); err == nil {
 			return intValue
+		}
+	}
+	return defaultValue
+}
+
+func getEnvAsBoolOrDefault(key string, defaultValue bool) bool {
+	if value := os.Getenv(key); value != "" {
+		if boolValue, err := strconv.ParseBool(value); err == nil {
+			return boolValue
 		}
 	}
 	return defaultValue
