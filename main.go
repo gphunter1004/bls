@@ -16,6 +16,9 @@ import (
 	"bus-location-system/utils"
 )
 
+// 마지막 정류장 갱신일 추적
+var lastBusStopRefreshDay string
+
 func main() {
 	// 설정 초기화
 	if err := config.Init(); err != nil {
@@ -23,9 +26,6 @@ func main() {
 	}
 
 	utils.LogInfo("버스 위치 정보 데이터 수집 시스템을 시작합니다...")
-
-	// 초기 운영시간 체크
-	checkOperatingHours()
 
 	// 서비스 초기화 - 병렬로 수행
 	timer := utils.StartTimer("서비스 초기화")
@@ -88,6 +88,9 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// 운영 시간 모니터링 시작 (정류장 갱신 포함)
+	go startOperatingHoursMonitor(ctx, apiService, redisService)
+
 	// API 1과 API 2를 독립적으로 실행
 	go startBusLocationCollection(ctx, apiService, redisService)
 	go startBusRealtimeCollection(ctx, apiService, redisService, esService)
@@ -95,6 +98,7 @@ func main() {
 	utils.LogInfo("실시간 데이터 수집이 시작되었습니다.")
 	utils.LogInfo("- 버스 위치 정보: %d초 간격", config.AppConfig.BusLocationInterval)
 	utils.LogInfo("- 버스 실시간 정보 + ES 동기화: %d초 간격", config.AppConfig.BusRealtimeInterval)
+	utils.LogInfo("- 운영 시간 모니터링: 1분 간격 (정류장 데이터 자동 갱신 포함)")
 
 	// 초기 API1 데이터 수집 (비동기)
 	go func() {
@@ -107,32 +111,82 @@ func main() {
 	utils.LogInfo("버스 위치 정보 데이터 수집 시스템을 종료합니다.")
 }
 
-// 운영 시간 체크 및 대기
-func checkOperatingHours() {
+// 운영 시간 지속 모니터링 및 API 제어
+func startOperatingHoursMonitor(ctx context.Context, apiService *services.APIService, redisService *services.RedisService) {
 	if !config.AppConfig.OperatingHours.IsEnabled {
-		return // 운영 시간 제한이 비활성화된 경우 바로 리턴
+		utils.LogInfo("운영 시간 제한이 비활성화되어 있습니다. 24시간 운영합니다.")
+		return // 운영 시간 제한이 비활성화된 경우 모니터링 불필요
 	}
 
-	if !config.AppConfig.OperatingHours.IsOperatingTime() {
-		waitTime := config.AppConfig.OperatingHours.TimeUntilNextOperating()
-		utils.LogInfo("⏰ 현재 운영 시간이 아닙니다. %v 후 운영을 시작합니다.", waitTime)
+	utils.LogInfo("🕒 운영 시간 모니터링을 시작합니다.")
 
-		// 운영 시간까지 대기 (1분마다 체크)
-		ticker := time.NewTicker(1 * time.Minute)
-		defer ticker.Stop()
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
 
-		for !config.AppConfig.OperatingHours.IsOperatingTime() {
-			select {
-			case <-ticker.C:
+	wasOperating := config.AppConfig.OperatingHours.IsOperatingTime()
+	if wasOperating {
+		utils.LogInfo("🌅 현재 운영 시간입니다.")
+	} else {
+		utils.LogInfo("🌙 현재 운영 시간이 아닙니다.")
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			utils.LogInfo("운영 시간 모니터링을 종료합니다")
+			return
+		case <-ticker.C:
+			isOperating := config.AppConfig.OperatingHours.IsOperatingTime()
+
+			// 운영 상태 변화 감지
+			if !wasOperating && isOperating {
+				// 운영 시간 시작
+				utils.LogInfo("🌅 운영 시간이 시작되었습니다!")
+				checkAndRefreshBusStopData(apiService, redisService)
+			} else if wasOperating && !isOperating {
+				// 운영 시간 종료
+				utils.LogInfo("🌙 운영 시간이 종료되었습니다.")
+			} else if !isOperating {
+				// 운영 시간 외 - 대기 시간 표시
 				remaining := config.AppConfig.OperatingHours.TimeUntilNextOperating()
 				if remaining > 0 {
 					utils.LogInfo("⏰ 운영 시작까지 %v 남았습니다.", remaining.Round(time.Minute))
 				}
 			}
-		}
 
-		utils.LogInfo("🌅 운영 시간이 시작되었습니다!")
+			wasOperating = isOperating
+		}
 	}
+}
+
+// 현재 운영 시간인지 확인하는 헬퍼 함수
+func isCurrentlyOperating() bool {
+	if !config.AppConfig.OperatingHours.IsEnabled {
+		return true // 운영 시간 제한이 비활성화된 경우 항상 운영 중
+	}
+	return config.AppConfig.OperatingHours.IsOperatingTime()
+}
+
+// 정류장 데이터 갱신이 필요한지 확인하고 실행
+func checkAndRefreshBusStopData(apiService *services.APIService, redisService *services.RedisService) {
+	today := time.Now().Format("2006-01-02")
+
+	// 오늘 이미 갱신했다면 건너뛰기
+	if lastBusStopRefreshDay == today {
+		return
+	}
+
+	utils.LogInfo("🔄 새로운 운영일 시작 - 정류장 데이터를 갱신합니다...")
+
+	// 정류장 데이터 갱신 실행 (비동기)
+	go func() {
+		if err := collectInitialDataConcurrent(apiService, redisService); err != nil {
+			utils.LogError("정류장 데이터 갱신 실패: %v", err)
+		} else {
+			lastBusStopRefreshDay = today
+			utils.LogInfo("✅ 정류장 데이터 갱신 완료 (갱신일: %s)", today)
+		}
+	}()
 }
 
 // 초기 정류장 데이터 수집 - 병렬 처리 개선
@@ -215,7 +269,7 @@ func collectInitialDataConcurrent(apiService *services.APIService, redisService 
 	return nil
 }
 
-// API 1: 버스 위치 정보 수집 (고루틴) - 컨텍스트 사용
+// API 1: 버스 위치 정보 수집 (고루틴)
 func startBusLocationCollection(ctx context.Context, apiService *services.APIService, redisService *services.RedisService) {
 	ticker := time.NewTicker(time.Duration(config.AppConfig.BusLocationInterval) * time.Second)
 	defer ticker.Stop()
@@ -228,11 +282,12 @@ func startBusLocationCollection(ctx context.Context, apiService *services.APISer
 			utils.LogInfo("버스 위치 정보 수집을 종료합니다")
 			return
 		case <-ticker.C:
-			// 운영 시간 체크
-			if !config.AppConfig.OperatingHours.IsOperatingTime() {
-				utils.LogInfo("⏰ 운영 시간 외입니다. API1 수집을 건너뜁니다.")
+			// 운영시간 체크
+			if !isCurrentlyOperating() {
+				utils.LogDebug("운영 시간 외 - API1 수집 건너뛰기")
 				continue
 			}
+
 			collectBusLocationsConcurrent(apiService, redisService)
 		}
 	}
@@ -333,7 +388,7 @@ func collectBusLocationsConcurrent(apiService *services.APIService, redisService
 	}
 }
 
-// API 2: 버스 실시간 위치 정보 수집 (고루틴) - ES 동기화 포함, 병렬 처리
+// API 2: 버스 실시간 위치 정보 수집 (고루틴)
 func startBusRealtimeCollection(ctx context.Context, apiService *services.APIService, redisService *services.RedisService, esService *services.ElasticsearchService) {
 	ticker := time.NewTicker(time.Duration(config.AppConfig.BusRealtimeInterval) * time.Second)
 	defer ticker.Stop()
@@ -346,11 +401,12 @@ func startBusRealtimeCollection(ctx context.Context, apiService *services.APISer
 			utils.LogInfo("버스 실시간 위치 정보 수집을 종료합니다")
 			return
 		case <-ticker.C:
-			// 운영 시간 체크
-			if !config.AppConfig.OperatingHours.IsOperatingTime() {
-				utils.LogInfo("⏰ 운영 시간 외입니다. API2 수집을 건너뜁니다.")
+			// 운영시간 체크
+			if !isCurrentlyOperating() {
+				utils.LogDebug("운영 시간 외 - API2 수집 건너뛰기")
 				continue
 			}
+
 			collectBusRealtimeAndSyncConcurrent(apiService, redisService, esService)
 		}
 	}
@@ -452,13 +508,6 @@ func collectBusRealtimeAndSyncConcurrent(apiService *services.APIService, redisS
 			syncDuration := syncTimer.Stop()
 			utils.LogInfo("ES 동기화 완료 (소요시간: %v)", syncDuration)
 		}()
-	}
-}
-
-// Elasticsearch 데이터 동기화 실행 - 비동기
-func syncElasticsearchData(esService *services.ElasticsearchService, redisService *services.RedisService) {
-	if err := esService.SyncUnifiedDataFromRedis(redisService); err != nil {
-		utils.LogError("Elasticsearch 데이터 동기화 실패: %v", err)
 	}
 }
 

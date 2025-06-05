@@ -42,6 +42,11 @@ type Config struct {
 	// 운영 시간 설정
 	OperatingHours OperatingHours
 
+	// 정류장 데이터 갱신 설정
+	BusStopRefreshEnabled bool // 일일 정류장 데이터 갱신 활성화
+	BusStopClearOldData   bool // 갱신 시 기존 데이터 삭제 여부
+	BusStopRefreshOnStart bool // 시작 시 무조건 갱신 여부
+
 	// Redis 설정
 	RedisAddr     string
 	RedisPassword string
@@ -85,6 +90,11 @@ func Init() error {
 		// 운영 시간 설정
 		OperatingHours: parseOperatingHours(),
 
+		// 정류장 데이터 갱신 설정
+		BusStopRefreshEnabled: getEnvAsBoolOrDefault("BUS_STOP_REFRESH_ENABLED", true),
+		BusStopClearOldData:   getEnvAsBoolOrDefault("BUS_STOP_CLEAR_OLD_DATA", true),
+		BusStopRefreshOnStart: getEnvAsBoolOrDefault("BUS_STOP_REFRESH_ON_START", false),
+
 		RedisAddr:     getEnvOrDefault("REDIS_ADDR", "localhost:6379"),
 		RedisPassword: getEnvOrDefault("REDIS_PASSWORD", ""),
 		RedisDB:       getEnvAsIntOrDefault("REDIS_DB", 0),
@@ -121,6 +131,15 @@ func Init() error {
 			AppConfig.OperatingHours.EndTime.Format("15:04"))
 	} else {
 		log.Printf("운영 시간 제한: 비활성화 (24시간 운영)")
+	}
+
+	// 정류장 갱신 설정 로그
+	if AppConfig.BusStopRefreshEnabled {
+		log.Printf("정류장 데이터 일일 갱신: 활성화")
+		log.Printf("- 기존 데이터 삭제: %v", AppConfig.BusStopClearOldData)
+		log.Printf("- 시작 시 강제 갱신: %v", AppConfig.BusStopRefreshOnStart)
+	} else {
+		log.Printf("정류장 데이터 일일 갱신: 비활성화")
 	}
 
 	return nil
